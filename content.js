@@ -636,80 +636,13 @@ class ETAContentScript {
       
       console.log(`ETA Exporter: Starting to load ALL pages. Total invoices to load: ${this.totalCount}`);
       
-      // Always start from page 1 to ensure we get everything
-      await this.navigateToFirstPage();
+      // Use faster bulk loading approach
+      const result = await this.loadAllPagesDataFast(options);
       
-      let processedInvoices = 0;
-      let currentPageNum = 1;
-      let maxAttempts = 1000; // Safety limit
-      let attempts = 0;
-      
-      // Continue until we've processed all invoices or reached limits
-      while (processedInvoices < this.totalCount && attempts < maxAttempts) {
-        attempts++;
-        
-        try {
-          console.log(`ETA Exporter: Processing page ${currentPageNum}, attempt ${attempts}...`);
-          
-          // Update progress
-          if (this.progressCallback) {
-            this.progressCallback({
-              currentPage: currentPageNum,
-              totalPages: this.totalPages,
-              message: `جاري معالجة الصفحة ${currentPageNum}... (${processedInvoices}/${this.totalCount} فاتورة)`,
-              percentage: this.totalCount > 0 ? (processedInvoices / this.totalCount) * 100 : 0
-            });
-          }
-          
-          // Wait for page to load completely
-          await this.waitForPageLoadComplete();
-          
-          // Scan invoices on current page
-          this.scanForInvoices();
-          
-          if (this.invoiceData.length > 0) {
-            // Add page data to collection with correct serial numbers
-            const pageData = this.invoiceData.map((invoice, index) => ({
-              ...invoice,
-              pageNumber: currentPageNum,
-              serialNumber: processedInvoices + index + 1,
-              globalIndex: processedInvoices + index + 1
-            }));
-            
-            this.allPagesData.push(...pageData);
-            processedInvoices += this.invoiceData.length;
-            
-            console.log(`ETA Exporter: Page ${currentPageNum} processed, collected ${this.invoiceData.length} invoices. Total: ${processedInvoices}/${this.totalCount}`);
-          } else {
-            console.warn(`ETA Exporter: No invoices found on page ${currentPageNum}`);
-          }
-          
-          // Check if we've got all invoices
-          if (processedInvoices >= this.totalCount) {
-            console.log(`ETA Exporter: Successfully loaded all ${processedInvoices} invoices!`);
-            break;
-          }
-          
-          // Try to navigate to next page
-          const navigatedToNext = await this.navigateToNextPageRobust();
-          if (!navigatedToNext) {
-            console.log('ETA Exporter: Cannot navigate to next page, stopping');
-            break;
-          }
-          
-          currentPageNum++;
-          await this.delay(2000); // Wait between pages
-          
-        } catch (error) {
-          console.error(`Error processing page ${currentPageNum}:`, error);
-          
-          // Try to continue to next page
-          const navigatedToNext = await this.navigateToNextPageRobust();
-          if (!navigatedToNext) {
-            break;
-          }
-          currentPageNum++;
-        }
+      if (result.success) {
+        this.allPagesData = result.data;
+      } else {
+        throw new Error(result.error || 'Failed to load data');
       }
       
       console.log(`ETA Exporter: Completed! Loaded ${this.allPagesData.length} invoices out of ${this.totalCount} total.`);
@@ -731,6 +664,446 @@ class ETAContentScript {
       };
     } finally {
       this.isProcessingAllPages = false;
+    }
+  }
+  
+  async loadAllPagesDataFast(options = {}) {
+    try {
+      // Method 1: Try to load all data by changing page size
+      const fastResult = await this.tryLoadAllWithLargePageSize();
+      if (fastResult.success) {
+        return fastResult;
+      }
+      
+      // Method 2: Use parallel page loading
+      const parallelResult = await this.loadPagesInParallel();
+      if (parallelResult.success) {
+        return parallelResult;
+      }
+      
+      // Method 3: Fallback to optimized sequential loading
+      return await this.loadPagesSequentiallyOptimized();
+      
+    } catch (error) {
+      console.error('Fast loading failed:', error);
+      return { success: false, error: error.message, data: [] };
+    }
+  }
+  
+  async tryLoadAllWithLargePageSize() {
+    try {
+      console.log('ETA Exporter: Trying to load all data with large page size...');
+      
+      // Look for page size selector
+      const pageSizeSelectors = [
+        'select[aria-label*="Items per page"]',
+        'select[aria-label*="عدد العناصر"]',
+        '.ms-Dropdown-title',
+        '[data-automation-key="pageSize"]',
+        'select:has(option[value="100"])',
+        'select:has(option[value="200"])'
+      ];
+      
+      let pageSizeControl = null;
+      for (const selector of pageSizeSelectors) {
+        pageSizeControl = document.querySelector(selector);
+        if (pageSizeControl) break;
+      }
+      
+      if (pageSizeControl) {
+        // Try to set maximum page size
+        const maxSizes = ['500', '200', '100', '50'];
+        
+        for (const size of maxSizes) {
+          if (this.totalCount <= parseInt(size)) {
+            console.log(`ETA Exporter: Setting page size to ${size}`);
+            
+            if (pageSizeControl.tagName === 'SELECT') {
+              const option = pageSizeControl.querySelector(`option[value="${size}"]`);
+              if (option) {
+                pageSizeControl.value = size;
+                pageSizeControl.dispatchEvent(new Event('change', { bubbles: true }));
+                
+                // Wait for page to reload
+                await this.delay(3000);
+                await this.waitForPageLoadComplete();
+                
+                // Scan all data
+                this.scanForInvoices();
+                
+                if (this.invoiceData.length >= this.totalCount * 0.9) {
+                  console.log(`ETA Exporter: Successfully loaded ${this.invoiceData.length} invoices with large page size`);
+                  
+                  const processedData = this.invoiceData.map((invoice, index) => ({
+                    ...invoice,
+                    pageNumber: 1,
+                    serialNumber: index + 1,
+                    globalIndex: index + 1
+                  }));
+                  
+                  return { success: true, data: processedData };
+                }
+              }
+            } else {
+              // Handle dropdown controls
+              pageSizeControl.click();
+              await this.delay(500);
+              
+              const sizeOption = document.querySelector(`[data-index="${size}"], [title="${size}"], [aria-label="${size}"]`);
+              if (sizeOption) {
+                sizeOption.click();
+                await this.delay(3000);
+                await this.waitForPageLoadComplete();
+                
+                this.scanForInvoices();
+                
+                if (this.invoiceData.length >= this.totalCount * 0.9) {
+                  console.log(`ETA Exporter: Successfully loaded ${this.invoiceData.length} invoices with large page size`);
+                  
+                  const processedData = this.invoiceData.map((invoice, index) => ({
+                    ...invoice,
+                    pageNumber: 1,
+                    serialNumber: index + 1,
+                    globalIndex: index + 1
+                  }));
+                  
+                  return { success: true, data: processedData };
+                }
+              }
+            }
+            break;
+          }
+        }
+      }
+      
+      return { success: false, error: 'Could not set large page size' };
+      
+    } catch (error) {
+      console.error('Large page size method failed:', error);
+      return { success: false, error: error.message };
+    }
+  }
+  
+  async loadPagesInParallel() {
+    try {
+      console.log('ETA Exporter: Trying parallel page loading...');
+      
+      // This method works if the portal supports direct page navigation via URL parameters
+      const currentUrl = window.location.href;
+      const urlParams = new URLSearchParams(window.location.search);
+      
+      // Check if URL has page parameter
+      const hasPageParam = urlParams.has('page') || urlParams.has('p') || currentUrl.includes('page=');
+      
+      if (!hasPageParam) {
+        return { success: false, error: 'URL does not support page parameters' };
+      }
+      
+      const allData = [];
+      const batchSize = 3; // Process 3 pages at a time
+      
+      for (let i = 1; i <= this.totalPages; i += batchSize) {
+        const batch = [];
+        
+        for (let j = i; j < Math.min(i + batchSize, this.totalPages + 1); j++) {
+          batch.push(this.loadPageData(j));
+        }
+        
+        if (this.progressCallback) {
+          this.progressCallback({
+            currentPage: i,
+            totalPages: this.totalPages,
+            message: `جاري تحميل الصفحات ${i}-${Math.min(i + batchSize - 1, this.totalPages)}...`,
+            percentage: (i / this.totalPages) * 100
+          });
+        }
+        
+        const batchResults = await Promise.allSettled(batch);
+        
+        batchResults.forEach((result, index) => {
+          if (result.status === 'fulfilled' && result.value.success) {
+            allData.push(...result.value.data);
+          } else {
+            console.warn(`Failed to load page ${i + index}:`, result.reason);
+          }
+        });
+        
+        // Small delay between batches
+        if (i + batchSize <= this.totalPages) {
+          await this.delay(1000);
+        }
+      }
+      
+      if (allData.length >= this.totalCount * 0.8) {
+        console.log(`ETA Exporter: Parallel loading successful, got ${allData.length} invoices`);
+        return { success: true, data: allData };
+      }
+      
+      return { success: false, error: 'Parallel loading did not get enough data' };
+      
+    } catch (error) {
+      console.error('Parallel loading failed:', error);
+      return { success: false, error: error.message };
+    }
+  }
+  
+  async loadPageData(pageNumber) {
+    try {
+      // Create a new URL for the specific page
+      const currentUrl = window.location.href;
+      const url = new URL(currentUrl);
+      
+      // Try different page parameter names
+      const pageParams = ['page', 'p', 'pageNumber', 'pageIndex'];
+      
+      for (const param of pageParams) {
+        url.searchParams.set(param, pageNumber.toString());
+        
+        const response = await fetch(url.toString(), {
+          method: 'GET',
+          credentials: 'same-origin',
+          headers: {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'ar,en;q=0.5',
+            'Cache-Control': 'no-cache'
+          }
+        });
+        
+        if (response.ok) {
+          const html = await response.text();
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(html, 'text/html');
+          
+          // Extract data from the parsed document
+          const pageData = this.extractDataFromDocument(doc, pageNumber);
+          
+          if (pageData.length > 0) {
+            return { success: true, data: pageData };
+          }
+        }
+      }
+      
+      return { success: false, error: `Could not load page ${pageNumber}` };
+      
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+  
+  extractDataFromDocument(doc, pageNumber) {
+    const data = [];
+    
+    try {
+      // Use the same extraction logic but on the parsed document
+      const rows = doc.querySelectorAll('.ms-DetailsRow[role="row"], .ms-List-cell[role="gridcell"]');
+      
+      rows.forEach((row, index) => {
+        const invoiceData = this.extractDataFromRowElement(row, index + 1, pageNumber);
+        if (this.isValidInvoiceData(invoiceData)) {
+          data.push(invoiceData);
+        }
+      });
+      
+    } catch (error) {
+      console.error(`Error extracting data from page ${pageNumber}:`, error);
+    }
+    
+    return data;
+  }
+  
+  extractDataFromRowElement(row, index, pageNumber) {
+    // Similar to extractDataFromRow but works with any element
+    const invoice = {
+      index: index,
+      pageNumber: pageNumber,
+      serialNumber: ((pageNumber - 1) * this.resultsPerPage) + index,
+      
+      // Initialize with defaults
+      viewButton: 'عرض',
+      documentType: 'فاتورة',
+      documentVersion: '1.0',
+      status: '',
+      issueDate: '',
+      submissionDate: '',
+      invoiceCurrency: 'EGP',
+      invoiceValue: '',
+      vatAmount: '',
+      taxDiscount: '0',
+      totalInvoice: '',
+      internalNumber: '',
+      electronicNumber: '',
+      sellerTaxNumber: '',
+      sellerName: '',
+      sellerAddress: '',
+      buyerTaxNumber: '',
+      buyerName: '',
+      buyerAddress: '',
+      purchaseOrderRef: '',
+      purchaseOrderDesc: '',
+      salesOrderRef: '',
+      electronicSignature: 'موقع إلكترونياً',
+      foodDrugGuide: '',
+      externalLink: '',
+      
+      issueTime: '',
+      totalAmount: '',
+      currency: 'EGP',
+      submissionId: '',
+      details: []
+    };
+    
+    try {
+      // Extract using the same methods as before
+      this.extractUsingDataAttributes(row, invoice);
+      this.extractUsingCellPositions(row, invoice);
+      this.extractUsingTextContent(row, invoice);
+      
+      if (invoice.electronicNumber) {
+        invoice.externalLink = this.generateExternalLink(invoice);
+      }
+      
+    } catch (error) {
+      console.warn(`Error extracting data from row ${index} on page ${pageNumber}:`, error);
+    }
+    
+    return invoice;
+  }
+  
+  async loadPagesSequentiallyOptimized() {
+    try {
+      console.log('ETA Exporter: Using optimized sequential loading...');
+      
+      // Start from current page to avoid unnecessary navigation
+      let processedInvoices = 0;
+      let currentPageNum = this.currentPage;
+      const allData = [];
+      
+      // First, collect data from current page
+      this.scanForInvoices();
+      if (this.invoiceData.length > 0) {
+        const pageData = this.invoiceData.map((invoice, index) => ({
+          ...invoice,
+          pageNumber: currentPageNum,
+          serialNumber: ((currentPageNum - 1) * this.resultsPerPage) + index + 1,
+          globalIndex: processedInvoices + index + 1
+        }));
+        
+        allData.push(...pageData);
+        processedInvoices += this.invoiceData.length;
+      }
+      
+      // Navigate to remaining pages more efficiently
+      const remainingPages = [];
+      
+      // Go forward from current page
+      for (let i = currentPageNum + 1; i <= this.totalPages; i++) {
+        remainingPages.push(i);
+      }
+      
+      // Go backward from current page
+      for (let i = currentPageNum - 1; i >= 1; i--) {
+        remainingPages.push(i);
+      }
+      
+      // Process remaining pages with optimized navigation
+      for (const pageNum of remainingPages) {
+        try {
+          if (this.progressCallback) {
+            this.progressCallback({
+              currentPage: pageNum,
+              totalPages: this.totalPages,
+              message: `جاري معالجة الصفحة ${pageNum}... (${processedInvoices}/${this.totalCount} فاتورة)`,
+              percentage: this.totalCount > 0 ? (processedInvoices / this.totalCount) * 100 : 0
+            });
+          }
+          
+          // Navigate directly to page number
+          const navigated = await this.navigateToPageDirectly(pageNum);
+          if (!navigated) {
+            console.warn(`Could not navigate to page ${pageNum}`);
+            continue;
+          }
+          
+          // Reduced wait time
+          await this.delay(1500);
+          await this.waitForPageLoadComplete();
+          
+          this.scanForInvoices();
+          
+          if (this.invoiceData.length > 0) {
+            const pageData = this.invoiceData.map((invoice, index) => ({
+              ...invoice,
+              pageNumber: pageNum,
+              serialNumber: ((pageNum - 1) * this.resultsPerPage) + index + 1,
+              globalIndex: processedInvoices + index + 1
+            }));
+            
+            allData.push(...pageData);
+            processedInvoices += this.invoiceData.length;
+            
+            console.log(`ETA Exporter: Page ${pageNum} processed, collected ${this.invoiceData.length} invoices. Total: ${processedInvoices}/${this.totalCount}`);
+          }
+          
+          // Check if we have enough data
+          if (processedInvoices >= this.totalCount) {
+            break;
+          }
+          
+        } catch (error) {
+          console.error(`Error processing page ${pageNum}:`, error);
+          continue;
+        }
+      }
+      
+      return { success: true, data: allData };
+      
+    } catch (error) {
+      console.error('Optimized sequential loading failed:', error);
+      return { success: false, error: error.message, data: [] };
+    }
+  }
+  
+  async navigateToPageDirectly(pageNumber) {
+    try {
+      // Method 1: Click on page number button directly
+      const pageButtons = document.querySelectorAll('button, a');
+      for (const button of pageButtons) {
+        const buttonText = button.textContent?.trim();
+        if (parseInt(buttonText) === pageNumber) {
+          console.log(`ETA Exporter: Clicking page ${pageNumber} button directly`);
+          button.click();
+          return true;
+        }
+      }
+      
+      // Method 2: Use input field if available
+      const pageInput = document.querySelector('input[aria-label*="page"], input[placeholder*="page"], input[type="number"]');
+      if (pageInput) {
+        pageInput.value = pageNumber.toString();
+        pageInput.dispatchEvent(new Event('change', { bubbles: true }));
+        pageInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        return true;
+      }
+      
+      // Method 3: Navigate step by step (faster than before)
+      const currentPage = this.extractCurrentPage();
+      const diff = pageNumber - currentPage;
+      
+      if (Math.abs(diff) <= 3) {
+        // If close, navigate step by step
+        for (let i = 0; i < Math.abs(diff); i++) {
+          const success = diff > 0 ? await this.navigateToNextPageRobust() : await this.navigateToPreviousPage();
+          if (!success) return false;
+          await this.delay(800); // Reduced delay
+        }
+        return true;
+      }
+      
+      return false;
+      
+    } catch (error) {
+      console.error(`Error navigating to page ${pageNumber}:`, error);
+      return false;
     }
   }
   

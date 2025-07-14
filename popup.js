@@ -162,13 +162,13 @@ class ETAInvoiceExporter {
   }
   
   showMultiPageWarning() {
-    const warningText = `تحذير: سيتم تحميل جميع الصفحات (${this.totalPages} صفحة) وقد يستغرق وقتاً أطول.`;
+    const warningText = `سيتم تحميل جميع الفواتير (${this.totalCount} فاتورة) بأسرع طريقة ممكنة.`;
     this.showStatus(warningText, 'loading');
     
     setTimeout(() => {
       this.elements.status.textContent = '';
       this.elements.status.className = 'status';
-    }, 3000);
+    }, 2000);
   }
   
   async checkCurrentPage() {
@@ -357,9 +357,16 @@ class ETAInvoiceExporter {
   
   async exportAllPages(format, options) {
     this.showProgress();
-    this.showStatus('جاري تحميل جميع الصفحات...', 'loading');
+    this.showStatus('جاري تحميل جميع الفواتير بسرعة...', 'loading');
     
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    
+    this.updateProgress({
+      currentPage: 0,
+      totalPages: this.totalPages,
+      message: 'جاري البحث عن أسرع طريقة للتحميل...',
+      percentage: 5
+    });
     
     const allData = await this.sendMessageWithRetry(tab.id, { 
       action: 'getAllPagesData',
@@ -367,16 +374,17 @@ class ETAInvoiceExporter {
     });
     
     if (!allData || !allData.success) {
-      throw new Error('فشل في تحميل جميع الصفحات: ' + (allData?.error || 'خطأ غير معروف'));
+      throw new Error('فشل في تحميل جميع الفواتير: ' + (allData?.error || 'خطأ غير معروف'));
     }
     
     let dataToExport = allData.data;
     
     if (options.downloadDetails && dataToExport.length > 0) {
       this.updateProgress({
-        currentPage: this.totalPages,
+        currentPage: this.totalPages, 
         totalPages: this.totalPages,
-        message: 'جاري تحميل تفاصيل جميع الفواتير...'
+        message: 'جاري تحميل تفاصيل جميع الفواتير...',
+        percentage: 90
       });
       
       dataToExport = await this.loadInvoiceDetails(dataToExport, tab.id);
@@ -385,11 +393,15 @@ class ETAInvoiceExporter {
     this.updateProgress({
       currentPage: this.totalPages,
       totalPages: this.totalPages,
-      message: 'جاري إنشاء الملف...'
+      message: 'جاري إنشاء الملف...',
+      percentage: 95
     });
     
     await this.generateFile(dataToExport, format, options);
-    this.showStatus(`تم تصدير ${dataToExport.length} فاتورة من جميع الصفحات بنجاح!`, 'success');
+    
+    // Show final success message with details
+    const successMessage = `تم تصدير ${dataToExport.length} فاتورة بنجاح! ${allData.totalProcessed ? `(من أصل ${allData.expectedTotal} فاتورة متوقعة)` : ''}`;
+    this.showStatus(successMessage, 'success');
   }
   
   showProgress() {
@@ -406,7 +418,7 @@ class ETAInvoiceExporter {
       return;
     }
     
-    const percentage = progress.percentage || (progress.totalPages > 0 ? (progress.currentPage / progress.totalPages) * 100 : 0);
+    const percentage = progress.percentage || (progress.totalPages > 0 ? Math.min((progress.currentPage / progress.totalPages) * 100, 100) : 0);
     
     const progressFill = this.elements.progressBar.querySelector('.progress-fill');
     if (progressFill) {
